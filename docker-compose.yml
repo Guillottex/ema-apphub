@@ -1,0 +1,125 @@
+# EMA AppHub — plataforma de repositorio y despliegue de aplicaciones
+#   docker compose up -d        → iniciar
+#   docker compose down         → detener (los datos persisten)
+name: ema-apphub
+
+services:
+  # ───────── Reverse proxy (dominios + HTTPS Let's Encrypt) ─────────
+  traefik:
+    image: traefik:v3.6
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=${APPS_NETWORK:-ema_apps}
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@example.com}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+      - --accesslog=false
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docker/traefik/dynamic:/etc/traefik/dynamic:ro
+      - traefik_certs:/letsencrypt
+    networks: [ema_apps]
+
+  # ───────── Base de datos de la plataforma (independiente de las apps) ─────────
+  platform-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-apphub}
+      POSTGRES_USER: ${POSTGRES_USER:-apphub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD en .env}
+      TZ: ${TZ:-America/Argentina/Buenos_Aires}
+    volumes:
+      - platform_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [internal]
+
+  # ───────── API (único servicio con acceso al socket Docker) ─────────
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: ema-apphub/backend:latest
+    restart: unless-stopped
+    depends_on:
+      platform-db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      TZ: ${TZ:-America/Argentina/Buenos_Aires}
+      DATABASE_URL: postgres://${POSTGRES_USER:-apphub}:${POSTGRES_PASSWORD}@platform-db:5432/${POSTGRES_DB:-apphub}
+      JWT_SECRET: ${JWT_SECRET:?Defina JWT_SECRET en .env}
+      JWT_EXPIRES_HOURS: ${JWT_EXPIRES_HOURS:-8}
+      MASTER_KEY: ${MASTER_KEY:?Defina MASTER_KEY en .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      TRUST_PROXY: ${TRUST_PROXY:-2}
+      DATA_DIR: ${DATA_DIR:-/opt/ema-apphub/data}
+      APPS_NETWORK: ${APPS_NETWORK:-ema_apps}
+      PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
+      APPS_BASE_DOMAIN: ${APPS_BASE_DOMAIN:-}
+      TRAEFIK_ENABLED: ${TRAEFIK_ENABLED:-true}
+      PORT_RANGE_START: ${PORT_RANGE_START:-8100}
+      PORT_RANGE_END: ${PORT_RANGE_END:-8999}
+      PLATFORM_HTTP_PORT: ${PLATFORM_HTTP_PORT:-8080}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-500}
+      HEALTH_INTERVAL_SEC: ${HEALTH_INTERVAL_SEC:-60}
+      DEPLOY_HEALTH_WAIT_SEC: ${DEPLOY_HEALTH_WAIT_SEC:-90}
+      BUILD_TIMEOUT_MIN: ${BUILD_TIMEOUT_MIN:-30}
+      TERMINAL_ENABLED: ${TERMINAL_ENABLED:-true}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@emaservicios.com.ar}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Defina ADMIN_PASSWORD en .env}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Misma ruta dentro y fuera: los bind mounts y builds de las apps usan rutas del host
+      - ${DATA_DIR:-/opt/ema-apphub/data}:${DATA_DIR:-/opt/ema-apphub/data}
+    networks: [internal, ema_apps]
+
+  # ───────── Interfaz web ─────────
+  frontend:
+    build:
+      context: ./frontend
+    image: ema-apphub/frontend:latest
+    restart: unless-stopped
+    depends_on: [backend]
+    ports:
+      - "${PLATFORM_HTTP_PORT:-8080}:80"   # acceso directo por IP:puerto (sin dominio)
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${APPS_NETWORK:-ema_apps}
+      traefik.http.services.apphub.loadbalancer.server.port: "80"
+      traefik.http.routers.apphub.rule: Host(`${PLATFORM_DOMAIN:-apphub.localhost}`)
+      traefik.http.routers.apphub.entrypoints: websecure
+      traefik.http.routers.apphub.tls: "true"
+      traefik.http.routers.apphub.tls.certresolver: letsencrypt
+      traefik.http.routers.apphub-http.rule: Host(`${PLATFORM_DOMAIN:-apphub.localhost}`)
+      traefik.http.routers.apphub-http.entrypoints: web
+      traefik.http.routers.apphub-http.middlewares: redirect-to-https@file
+    networks: [internal, ema_apps]
+
+networks:
+  internal:
+    name: ema-apphub-internal
+  ema_apps:
+    name: ${APPS_NETWORK:-ema_apps}
+
+volumes:
+  platform_db:
+  traefik_certs:
